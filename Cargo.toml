@@ -1,0 +1,25 @@
+[package]
+name = "xerj-seed"
+version = "0.1.0"
+edition = "2021"
+description = "One-shot CLI that seeds an ES-compatible target index from a XERJ source index, then arms xerj's wal_tap for incremental sync."
+license = "Apache-2.0"
+repository = "https://github.com/Vinz2168/xerj-seed"
+readme = "README.md"
+keywords = ["xerj", "elasticsearch", "opensearch", "migration", "cli"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "xerj-seed"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+[profile.release]
+opt-level = 2

@@ -1,0 +1,9 @@
+/target
+Cargo.lock.bak
+
+# Local test scratch — real cluster data dirs, ad hoc scripts, credentials.
+/e2e-data/
+/*.local.sh
+.env
+*.pem
+*.key

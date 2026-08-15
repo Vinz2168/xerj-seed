@@ -1,0 +1,30 @@
+xerj-seed
+Copyright 2026 Vincenzo Lombardo
+
+This product includes software developed as part of the xerj-seed project
+(https://github.com/Vinz2168/xerj-seed).
+
+--------------------------------------------------------------------------------
+
+Adapted from xerj-org/xerj (Apache-2.0, https://github.com/xerj-org/xerj)
+
+The `_bulk` push semantics — `index` action with `version_type: external` and
+`version` set to the source document's `_seq_no`, so that a full rerun after
+an interruption always converges instead of duplicating writes — and the
+retry/fail-fast classification of target responses (transient: transport
+error, 5xx, 429, 408 — retried with capped exponential backoff and jitter;
+permanent: any other 4xx — reported immediately, not retried) are adapted
+from xerj's single-node WAL tap:
+
+  https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-engine/src/wal_tap.rs
+
+The `target_url` validation (rejecting embedded userinfo, e.g.
+`user:pass@host`, because an HTTP client turns it into an `Authorization`
+header behind the caller's back) and the redaction of credentials from any
+echoed/logged output are adapted from:
+
+  https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-api/src/wal_tap_api.rs
+
+No code from xerj was copied verbatim; the patterns above were reimplemented
+in this project's own Rust source. See README.md's Attribution section for
+more detail.
