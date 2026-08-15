@@ -50,6 +50,10 @@ impl EsClient {
         }
     }
 
+    pub fn get(&self, path: &str) -> RequestBuilder {
+        self.request(Method::GET, path)
+    }
+
     pub fn post(&self, path: &str) -> RequestBuilder {
         self.request(Method::POST, path)
     }

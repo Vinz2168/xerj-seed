@@ -1,5 +1,6 @@
 mod cli;
 mod http;
+mod mapping;
 mod push;
 mod retry;
 mod scan;
@@ -51,6 +52,20 @@ async fn run(args: Args) -> Result<()> {
         target.redacted_base_url(),
         args.batch_size
     );
+
+    // ── Mapping/settings import ─────────────────────────────────────────
+    // Before any document moves: give the target the source's real schema
+    // instead of leaving it to dynamic-mapping inference from the first
+    // _bulk batch. No-op (and safe to rerun) once the target index exists.
+    if !args.skip_mapping_import {
+        mapping::import_mapping_if_needed(
+            &source,
+            &target,
+            &args.source_index,
+            args.max_retries,
+        )
+        .await?;
+    }
 
     // A background task flips this the moment Ctrl-C is seen; the scan loop
     // checks it between pages so a PIT that is open always gets closed
@@ -114,17 +129,39 @@ async fn run(args: Args) -> Result<()> {
         );
     }
 
-    // ── Arm incremental sync ────────────────────────────────────────────
+    // ── Arm incremental sync (XERJ-only — see README's "Beyond XERJ") ──
+    // Everything above this point (mapping import, scan, push) is generic
+    // ES-compat wire protocol and has already fully succeeded by the time
+    // we get here. This step alone assumes --source-url is a XERJ node: it
+    // calls PUT /_xerj/wal_tap, a native XERJ endpoint no other engine
+    // exposes. A failure here — most commonly a 404 because --source-url is
+    // a real Elasticsearch/OpenSearch cluster — does not undo, invalidate,
+    // or need to roll back the migration that already happened; it just
+    // means the operator has to arrange their own incremental sync for that
+    // source engine.
     if args.enable_sync_after {
         eprintln!("xerj-seed: arming wal_tap on the source for incremental sync...");
-        sync::enable_wal_tap(
+        if let Err(e) = sync::enable_wal_tap(
             &source,
             &args.source_index,
             &args.target_url,
             args.target_auth(),
             args.max_retries,
         )
-        .await?;
+        .await
+        {
+            bail!(
+                "document migration succeeded ({} document(s) shipped to the target) — but \
+                 --enable-sync-after failed: {e:#}\n\n\
+                 --enable-sync-after is XERJ-specific: it calls PUT /_xerj/wal_tap on \
+                 --source-url, a native endpoint that only a XERJ node exposes. If \
+                 --source-url points to a real Elasticsearch or OpenSearch cluster, this \
+                 step was never going to succeed there — the migrated data on the target is \
+                 unaffected either way. Rerun without --enable-sync-after, or set up your \
+                 own incremental sync for that source engine.",
+                stats.shipped
+            );
+        }
         eprintln!("xerj-seed: wal_tap enabled on the source. Seed complete.");
     } else {
         eprintln!("xerj-seed: seed complete (--enable-sync-after not passed; wal_tap left untouched).");

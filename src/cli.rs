@@ -61,6 +61,18 @@ pub struct Args {
     /// may never recover, rather than retrying forever.
     #[arg(long, default_value_t = 10)]
     pub max_retries: u32,
+
+    /// Do not copy the source index's mapping/settings to the target before
+    /// pushing documents. By default xerj-seed fetches GET
+    /// /{source-index} from the source and, if the target index does not
+    /// already exist, creates it there with the same mappings and settings
+    /// — so the target ends up with the source's real schema instead of
+    /// whatever the target's dynamic-mapping inference guesses from the
+    /// first batch of documents. If the target index already exists, this
+    /// step is skipped either way (never touches an existing index's
+    /// mapping — safe to rerun, same as everything else in this tool).
+    #[arg(long, default_value_t = false)]
+    pub skip_mapping_import: bool,
 }
 
 impl Args {

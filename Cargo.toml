@@ -2,7 +2,7 @@
 name = "xerj-seed"
 version = "0.1.0"
 edition = "2021"
-description = "One-shot CLI that seeds an ES-compatible target index from a XERJ source index, then arms xerj's wal_tap for incremental sync."
+description = "One-shot CLI that migrates one index between any two ES-compatible clusters (Elasticsearch, OpenSearch, XERJ) via _search/_bulk, with optional XERJ wal_tap arming for incremental sync afterward."
 license = "Apache-2.0"
 repository = "https://github.com/Vinz2168/xerj-seed"
 readme = "README.md"

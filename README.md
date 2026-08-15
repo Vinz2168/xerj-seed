@@ -1,29 +1,37 @@
 # xerj-seed
 
-A one-shot CLI that seeds an ES-compatible target index from a
-[xerj](https://github.com/xerj-org/xerj) source index, then arms xerj's
-`wal_tap` on the source so the target keeps receiving writes incrementally,
-without any further intervention.
+A one-shot CLI that migrates one index between any two ES-compatible
+clusters — Elasticsearch, OpenSearch, or [xerj](https://github.com/xerj-org/xerj),
+in any combination — over the standard `_search`/`_bulk` wire protocol.
+Optionally arms xerj's `wal_tap` on the source afterward for incremental
+sync; that one step is the only part of this tool that assumes xerj is
+involved at all. See [Beyond XERJ](#beyond-xerj-generic-es-compatible-migration)
+for the general case.
 
 ```
-┌──────────────┐   1. full scan (PIT + search_after on _seq_no)   ┌──────────────────┐
-│  xerj source │ ───────────────────────────────────────────────▶ │ ES-compat target │
-│              │   2. _bulk push (index, version_type: external,  │ (xerj / OpenSearch│
-│              │      version = source _seq_no)                   │  / Elasticsearch) │
-│              │                                                   └──────────────────┘
-│              │   3. PUT /_xerj/wal_tap (enabled=true) ─── incremental sync from here on
-└──────────────┘
+┌──────────────┐   1. mapping/settings import (GET/PUT the index, once)  ┌──────────────┐
+│ ES-compatible│   2. full scan (PIT + search_after)                     │ ES-compatible│
+│    source    │ ───────────────────────────────────────────────────────▶│    target    │
+│ (xerj / ES / │   3. _bulk push (index, version_type: external,         │ (xerj / ES / │
+│  OpenSearch) │      version = source _seq_no)                          │  OpenSearch) │
+└──────────────┘                                                         └──────────────┘
+       │
+       └── 4. (optional, XERJ source only) PUT /_xerj/wal_tap ─── incremental sync from here on
 ```
 
 ## Why this exists
 
-`wal_tap` only ships writes that happen *after* it is turned on — it is
-explicitly not a backfill mechanism (see its own docs: "There is no
-backfill. Seed the target with snapshot/restore if it needs the existing
-documents."). `xerj-seed` is that seed step: it does the one-time bulk copy
-of everything already in the source index, and then flips `wal_tap` on at
-the exact point where the copy ends, so nothing written in between is lost
-and nothing has to be copied twice.
+The original motivating case: xerj's `wal_tap` only ships writes that happen
+*after* it is turned on — it is explicitly not a backfill mechanism (see its
+own docs: "There is no backfill. Seed the target with snapshot/restore if it
+needs the existing documents."). `xerj-seed` is that seed step: it does the
+one-time bulk copy of everything already in the source index, and then flips
+`wal_tap` on at the exact point where the copy ends, so nothing written in
+between is lost and nothing has to be copied twice.
+
+Steps 1–3 (mapping import, scan, push) have no idea what kind of cluster is
+on either end — they're plain ES-compat wire calls. Step 4 is the one xerj
+-specific extra, and it's entirely optional.
 
 ## Usage
 
@@ -50,12 +58,17 @@ xerj-seed \
   [Security](#security)).
 - `--batch-size` — documents per `_search` page and per `_bulk` request
   (default `1000`).
-- `--enable-sync-after` — after a successful scan+push, `PUT
-  /_xerj/wal_tap` on the source with `enabled=true`,
-  `indices=[--source-index]`, and the same `target_url`/`target_auth` this
-  run used, so the source starts streaming every subsequent write to the
-  target. `--source-auth` is reused as the admin credential for this call —
-  `/_xerj/wal_tap` is superuser-only on xerj.
+- `--enable-sync-after` — **XERJ-only**, see
+  [Beyond XERJ](#beyond-xerj-generic-es-compatible-migration). After a
+  successful scan+push, `PUT /_xerj/wal_tap` on the source with
+  `enabled=true`, `indices=[--source-index]`, and the same
+  `target_url`/`target_auth` this run used, so the source starts streaming
+  every subsequent write to the target. `--source-auth` is reused as the
+  admin credential for this call — `/_xerj/wal_tap` is superuser-only on
+  xerj.
+- `--skip-mapping-import` — don't copy the source index's mapping/settings
+  to the target first (see [Mapping/settings import](#mappingsettings-import)
+  below).
 - `--max-retries` — how many consecutive transient failures (5xx / 429 /
   408 / transport error) to absorb with backoff before giving up (default
   `10`). See [Resumability](#resumability--no-checkpoint-file).
@@ -66,6 +79,107 @@ xerj-seed \
 Progress is printed to stderr per batch (documents scanned, shipped,
 conflicts, rejections); there is no structured log file — this is a
 one-shot CLI, not a service.
+
+## Mapping/settings import
+
+Before any document moves, xerj-seed does `GET /{source-index}` on the
+source and, **only if the target doesn't already have that index**,
+creates it there with the same mappings and settings (`PUT
+/{index}` with a handful of non-portable, engine-assigned keys stripped —
+`uuid`, `version`, `provided_name`, `creation_date`, `history`). This means
+the target ends up with the source's real field types from the start,
+instead of whatever dynamic-mapping inference would have guessed from the
+first `_bulk` batch — which matters most exactly when source and target are
+different engines with different inference defaults (a `keyword` on one
+side vs. a `text` on the other for the same field is a common one).
+
+If the target index already exists, this step does nothing — it never
+edits an existing index's mapping. That makes it safe to rerun for the same
+reason everything else in this tool is: idempotent by construction, no
+state to reconcile. Pass `--skip-mapping-import` to disable it entirely and
+let the target's own dynamic mapping handle every field instead.
+
+## Beyond XERJ: generic ES-compatible migration
+
+Only one thing this tool does assumes xerj is on either end:
+`--enable-sync-after`, which calls `PUT /_xerj/wal_tap` — a native xerj
+endpoint. Everything else — the mapping/settings import, the PIT +
+`search_after` scan, the `_bulk` push — is the standard Elasticsearch wire
+protocol. `_bulk` (the target side) is genuinely universal — verified
+end-to-end against a real OpenSearch 3.7.0 target (see
+[Testing](#testing)) — and there's no reason to expect Elasticsearch to
+differ, since it's the same protocol OpenSearch forked from.
+
+**The source side's PIT is not universal, though**, and this is worth being
+precise about rather than optimistic: xerj-seed's scan uses Elasticsearch's
+PIT shape (`POST /{index}/_pit`, `DELETE /_pit` with `{"id": ...}`).
+Real Elasticsearch and xerj both speak that shape. **Real OpenSearch does
+not** — verified live against OpenSearch 3.7.0: `POST /{index}/_pit`
+returns `400`. OpenSearch's actual PIT API is `POST
+/{index}/_search/point_in_time`, closed via `DELETE /_search/point_in_time`
+with `{"pit_id": [...]}` (an array, under a different key) — a distinct
+enough shape that dialect-detection is a real follow-up, not a one-line
+fix. **So: a real Elasticsearch or xerj source works today; a real
+OpenSearch source does not yet** — only OpenSearch-as-*target* has been
+built and verified.
+
+Concretely, today:
+
+```sh
+# Elasticsearch → OpenSearch (e.g. moving off an Elastic-licensed cluster) — works
+xerj-seed \
+  --source-url  https://es-cluster.internal:9200 \
+  --source-index orders \
+  --source-auth "ApiKey $ES_API_KEY" \
+  --target-url  https://os-cluster.internal:9200 \
+  --target-auth "Basic $(printf '%s' 'admin:pass' | base64)"
+
+# Same-engine migration (cluster resize, region move, version upgrade
+# via reindex-to-new-cluster) — no --enable-sync-after either way
+xerj-seed \
+  --source-url  https://es-old.internal:9200 \
+  --source-index events \
+  --target-url  https://es-new.internal:9200
+```
+
+A real OpenSearch cluster as `--source-url` is not supported yet (see
+above) — that's a real gap, tracked as a follow-up, not a "should work but
+untested" claim.
+
+None of these pass `--enable-sync-after` — there's nothing xerj-specific to
+arm. If you *do* pass it with a source that isn't xerj, `PUT
+/_xerj/wal_tap` has nowhere to land there. Live-verified against a real
+OpenSearch 3.7.0 node: `400`, `{"error":"no handler found for uri
+[/_xerj/wal_tap] and method [PUT]"}` — its generic unknown-route response
+(not a `404`, worth knowing if you're expecting Elasticsearch's
+convention; a real Elasticsearch source, which unlike OpenSearch does get
+as far as this step, may well answer differently). Either way, this is
+the response the same retry/fail-fast policy the rest of this tool uses
+(see [Attribution](#attribution)) treats as a non-retryable failure, and
+`main.rs` wraps it before propagating — naming the document count already
+shipped and stating plainly that the migration is unaffected, rather than
+surfacing a bare HTTP error or leaving you to guess whether anything needs
+cleaning up:
+
+```
+xerj-seed: done. scanned=110 shipped=110 conflicts=0 rejected=0
+xerj-seed: arming wal_tap on the source for incremental sync...
+error: document migration succeeded (110 document(s) shipped to the target) — but
+--enable-sync-after failed: enable wal_tap: permanent failure, not retrying: HTTP 400: ...
+
+--enable-sync-after is XERJ-specific: it calls PUT /_xerj/wal_tap on --source-url, a
+native endpoint that only a XERJ node exposes. If --source-url points to a real
+Elasticsearch or OpenSearch cluster, this step was never going to succeed there — the
+migrated data on the target is unaffected either way. Rerun without --enable-sync-after,
+or set up your own incremental sync for that source engine.
+```
+
+The `HTTP 400: ...` line above was captured live (`PUT /_xerj/wal_tap`
+against real OpenSearch); the two lines around it are `main.rs`'s own
+wrapping, exercised by unit-equivalent reasoning rather than one single
+live run reaching this exact point — [today's PIT gap](#beyond-xerj-generic-es-compatible-migration)
+means a real OpenSearch source never gets this far (it fails earlier, at
+the scan), and no Elasticsearch cluster was reachable while writing this.
 
 ## Resumability — no checkpoint file
 
@@ -122,14 +236,32 @@ document (115–120, varied per run) lands on the target, `GET
 `_stats` reporting `healthy: true`, `lag_seq: 0`) with no further action.
 `scripts/e2e-smoke-test.sh` captures this same sequence in reusable form.
 
-A third leg against a real **Elasticsearch 8.x** target was attempted but
-not completed — the local Docker daemon used to test this could not pull
-the image (a registry/network issue in that environment, unrelated to
-this tool). Nothing in `xerj-seed` is OpenSearch-specific: it speaks
-plain `_bulk`/`_search`, the same wire format Elasticsearch serves, so
-there's no reason to expect different behavior there — but it hasn't been
-verified against a live ES cluster yet. Contributions running that leg
-are welcome.
+Mapping/settings import was verified the same way: an index created on the
+xerj source with an explicit mapping (a `keyword` field and a plain `text`
+field with no dynamic `.keyword` sub-field), migrated to the OpenSearch
+target, came back with that exact mapping — not what OpenSearch's own
+dynamic-mapping defaults would have inferred (which adds a `.keyword`
+sub-field to a `text`-looking string automatically). A second run against
+the same already-created target index confirmed the skip path: no mapping
+call made, the one document re-sent resolved as a version conflict rather
+than a duplicate.
+
+The [Beyond XERJ](#beyond-xerj-generic-es-compatible-migration) section's
+claims were checked directly rather than assumed: `_bulk` against real
+OpenSearch works (above); a real OpenSearch node as `--source-url` was
+tried and fails cleanly at the PIT-open step (`HTTP 400`, the response
+body quoted verbatim, not a panic or a hang) because OpenSearch's real PIT
+API has a different shape than Elasticsearch's — a genuine, now-documented
+gap rather than an assumption.
+
+A leg against a real **Elasticsearch** cluster (as either source or
+target) was attempted but not completed — the local Docker daemon used to
+test this could not pull the image (a registry/network issue in that
+environment, unrelated to this tool). `_bulk`/`_search` as the target side
+needs is the same wire format Elasticsearch serves, so there's no reason
+to expect different behavior there — but, per the section above, that is
+now explicitly flagged as unverified rather than implied by omission.
+Contributions running that leg are welcome.
 
 ## Attribution
 
