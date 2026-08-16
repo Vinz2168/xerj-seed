@@ -10,16 +10,32 @@
 //! /_search/scroll`, `DELETE /_search/scroll` — and is live-verified
 //! identical on xerj and on a real OpenSearch 3.7.0 node, including
 //! `seq_no_primary_term: true` surfacing a real `_seq_no` per hit under
-//! scroll exactly as it does under a plain search. Scroll is the more
-//! restrictive primitive (no `search_after`-style resumable cursor, no
-//! concurrent scroll batches), but this tool only ever runs one linear scan
-//! at a time, so none of that is missed — and portability across engines
-//! matters more here than the features scroll doesn't have.
+//! scroll exactly as it does under a plain search.
+//!
+//! Scroll is a snapshot taken at the moment it opens: a write made on the
+//! source *after* the scroll opens is not guaranteed to appear in the
+//! results, on any engine — the same consistency model PIT would have
+//! given, and the reason the mapping-import step and this scan both run
+//! before `--enable-sync-after` arms `wal_tap`, not after.
+//!
+//! **A real xerj bug this module works around.** `seq_no_primary_term:
+//! true` on the scroll-opening `_search?scroll=...` request is honored for
+//! that first page, but xerj's `_search/scroll` continuation handler drops
+//! it — every page after the first comes back with no `_seq_no` on a xerj
+//! source, live-verified up to 5 pages. Real Elasticsearch and OpenSearch
+//! both persist the flag for the scroll's lifetime, as documented (checked
+//! live against OpenSearch 3.7.0, 4 pages, `_seq_no` present throughout);
+//! only xerj drops it. [`backfill_missing_seq_no`] papers over this with
+//! one `_mget?seq_no_primary_term=true` call per page that needs it — not
+//! per document — rather than failing the whole scan. Filed as a bug
+//! against xerj-org/xerj; see the README's Testing section for the issue
+//! link. This workaround is harmless overhead everywhere else, since it
+//! only fires when `_seq_no` is actually missing from a page.
 //!
 //! The *version* pushed to the target is still the real `_seq_no` — see
-//! `wal_tap.rs`'s reasoning in the README's Attribution section — read the
-//! same way as before: `seq_no_primary_term: true` in the request, `_seq_no`
-//! as an ordinary field on each hit.
+//! `wal_tap.rs`'s reasoning in the README's Attribution section.
+
+use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -35,8 +51,18 @@ pub struct ScannedDoc {
     pub source: Value,
 }
 
-/// Pull `hits.hits` out of a `_search`/scroll response into [`ScannedDoc`]s.
-fn extract_docs(resp_body: &Value) -> Result<Vec<ScannedDoc>> {
+/// A hit as read straight off a `_search`/scroll response, before the
+/// `_seq_no` fallback. `seq_no` is `None` when the page didn't carry it —
+/// see the module docs for why that's a real, expected case on a xerj
+/// source, not necessarily a malformed response.
+struct RawHit {
+    id: String,
+    seq_no: Option<u64>,
+    source: Value,
+}
+
+/// Pull `hits.hits` out of a `_search`/scroll response into [`RawHit`]s.
+fn extract_hits(resp_body: &Value) -> Result<Vec<RawHit>> {
     let hits = resp_body
         .get("hits")
         .and_then(|h| h.get("hits"))
@@ -44,30 +70,22 @@ fn extract_docs(resp_body: &Value) -> Result<Vec<ScannedDoc>> {
         .cloned()
         .unwrap_or_default();
 
-    let mut docs = Vec::with_capacity(hits.len());
+    let mut out = Vec::with_capacity(hits.len());
     for hit in hits {
         let id = hit
             .get("_id")
             .and_then(Value::as_str)
             .context("hit carried no _id")?
             .to_string();
-        let seq_no = hit
-            .get("_seq_no")
-            .and_then(Value::as_u64)
-            .with_context(|| {
-                format!(
-                    "hit {id:?} carried no usable _seq_no (expected because \
-                     seq_no_primary_term=true was requested)"
-                )
-            })?;
+        let seq_no = hit.get("_seq_no").and_then(Value::as_u64);
         let source_doc = hit.get("_source").cloned().unwrap_or_else(|| json!({}));
-        docs.push(ScannedDoc {
+        out.push(RawHit {
             id,
             seq_no,
             source: source_doc,
         });
     }
-    Ok(docs)
+    Ok(out)
 }
 
 /// The `_scroll_id` a request carried, if any — ES/OpenSearch both include
@@ -79,6 +97,88 @@ fn extract_scroll_id(resp_body: &Value) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .with_context(|| format!("response carried no _scroll_id: {resp_body}"))
+}
+
+/// Resolve every [`RawHit`] to a [`ScannedDoc`], backfilling `_seq_no` via
+/// `_mget?seq_no_primary_term=true` for any hit that came back without one
+/// — see the module docs' "real xerj bug" section. One `_mget` call per
+/// page that needs it, carrying only the ids that are actually missing,
+/// not the whole page.
+async fn backfill_missing_seq_no(
+    source: &EsClient,
+    index: &str,
+    hits: Vec<RawHit>,
+    max_retries: u32,
+) -> Result<Vec<ScannedDoc>> {
+    let missing_ids: Vec<&str> = hits
+        .iter()
+        .filter(|h| h.seq_no.is_none())
+        .map(|h| h.id.as_str())
+        .collect();
+
+    let mut backfilled: HashMap<String, u64> = HashMap::new();
+    if !missing_ids.is_empty() {
+        let path = format!("{index}/_mget?seq_no_primary_term=true");
+        let body = json!({ "ids": missing_ids });
+        let resp_body = with_retry("backfill _seq_no via _mget", max_retries, || {
+            let body = body.clone();
+            let path = path.clone();
+            async move {
+                let resp = match source.post(&path).json(&body).send().await {
+                    Ok(r) => r,
+                    Err(e) => return Outcome::Retryable(format!("transport: {e}")),
+                };
+                let status = resp.status();
+                match classify_status(status) {
+                    Retryability::Success => match resp.json::<Value>().await {
+                        Ok(v) => Outcome::Done(v),
+                        Err(e) => Outcome::Retryable(format!("unparseable _mget response: {e}")),
+                    },
+                    Retryability::Retryable => Outcome::Retryable(format!("HTTP {status}")),
+                    Retryability::Permanent => {
+                        let snippet = resp.text().await.unwrap_or_default();
+                        Outcome::Permanent(format!("HTTP {status}: {snippet}"))
+                    }
+                }
+            }
+        })
+        .await?;
+
+        for doc in resp_body
+            .get("docs")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            let (Some(id), Some(seq_no)) = (
+                doc.get("_id").and_then(Value::as_str),
+                doc.get("_seq_no").and_then(Value::as_u64),
+            ) else {
+                continue;
+            };
+            backfilled.insert(id.to_string(), seq_no);
+        }
+    }
+
+    hits.into_iter()
+        .map(|h| {
+            let seq_no = match h.seq_no {
+                Some(s) => s,
+                None => *backfilled.get(&h.id).with_context(|| {
+                    format!(
+                        "hit {:?} carried no _seq_no and the _mget backfill didn't resolve one \
+                         either",
+                        h.id
+                    )
+                })?,
+            };
+            Ok(ScannedDoc {
+                id: h.id,
+                seq_no,
+                source: h.source,
+            })
+        })
+        .collect()
 }
 
 /// `POST /{index}/_search?scroll={keep_alive}` — opens the scroll and
@@ -123,7 +223,8 @@ pub async fn open_scroll(
     .await?;
 
     let scroll_id = extract_scroll_id(&resp_body)?;
-    let docs = extract_docs(&resp_body)?;
+    let hits = extract_hits(&resp_body)?;
+    let docs = backfill_missing_seq_no(source, index, hits, max_retries).await?;
     Ok((scroll_id, docs))
 }
 
@@ -132,6 +233,7 @@ pub async fn open_scroll(
 /// end-of-scan signal, same as the rest of this tool's paging.
 pub async fn next_page(
     source: &EsClient,
+    index: &str,
     scroll_id: &str,
     keep_alive: &str,
     max_retries: u32,
@@ -162,7 +264,8 @@ pub async fn next_page(
     .await?;
 
     let next_scroll_id = extract_scroll_id(&resp_body)?;
-    let docs = extract_docs(&resp_body)?;
+    let hits = extract_hits(&resp_body)?;
+    let docs = backfill_missing_seq_no(source, index, hits, max_retries).await?;
     Ok((next_scroll_id, docs))
 }
 

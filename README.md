@@ -115,8 +115,35 @@ live, OpenSearch 3.7.0's actual PIT API is a differently-shaped
 `POST /{index}/_search/point_in_time`. The scan now uses `_scroll`
 instead (`POST /{index}/_search?scroll=…`, `POST /_search/scroll`,
 `DELETE /_search/scroll`) specifically because it predates that fork and
-is live-verified byte-for-byte identical on xerj and on a real OpenSearch
-3.7.0 node, `_seq_no` included. See `scan.rs`'s module docs for the detail.
+is broadly compatible across ES-compatible versions and distributions —
+live-verified against xerj, real Elasticsearch 7.10.2, and real
+OpenSearch 3.7.0, all three. See `scan.rs`'s module docs for the detail.
+
+`_scroll`, like PIT before it, is a snapshot taken at the moment it
+opens: a write made on the source *after* the scan starts is not
+guaranteed to appear in the results, on any engine. This is exactly why
+the mapping-import step and the scan both run **before**
+`--enable-sync-after` arms `wal_tap` rather than after — arming it first
+would risk a write landing in the gap between "the scan already read past
+that point" and "the tap is live," and losing it silently. Ordering it
+this way is what makes the combination correct: anything the scan might
+have missed is, by construction, either already reflected by the time
+the tap turns on or covered by the tap itself from that moment forward.
+
+**A real xerj bug found and worked around while verifying this.**
+`seq_no_primary_term: true` on the scroll-opening request is honored for
+page one, but xerj's `_search/scroll` continuation handler silently drops
+it — every page after the first came back with no `_seq_no` at all,
+live-verified up to 5 pages against a 235-document index. Real
+Elasticsearch and OpenSearch both persist the flag for the scroll's whole
+lifetime, as documented (also live-verified, 4 pages on OpenSearch 3.7.0,
+`_seq_no` present throughout — this is xerj-specific, not a protocol
+limitation). Filed as [xerj-org/xerj#428](https://github.com/xerj-org/xerj/issues/428);
+worked around in the
+meantime with one `_mget?seq_no_primary_term=true` call per affected page
+(carrying only that page's ids, not the whole page's documents again) —
+see `backfill_missing_seq_no` in `scan.rs`. Harmless overhead everywhere
+else, since it only fires when a page is actually missing `_seq_no`.
 
 Concretely, today:
 
@@ -277,6 +304,34 @@ on the target with that exact mapping, not what the target's own
 dynamic-mapping defaults would have inferred (OpenSearch in particular
 adds a `.keyword` sub-field to a `text`-looking string automatically —
 this is exactly the divergence the feature exists to prevent).
+
+**Multi-page scrolling**, specifically, against a real xerj source: a
+235-document index at `--batch-size 50` (5 pages) scanned and shipped
+correctly, and independently verified at the protocol level — walking
+the same `_search?scroll=…` → `_search/scroll` → `_search/scroll` → …
+sequence by hand confirmed every page advanced the cursor correctly
+(no repeated page, no gap, no early termination) and the union of all
+pages was exactly the source's 235 ids, no more, no fewer. This is also
+how the `_seq_no`-dropped-after-page-one bug above ([#428](https://github.com/xerj-org/xerj/issues/428))
+surfaced: earlier testing never scanned more than ~2 pages, so it was
+never caught before this round.
+
+**Scroll cleanup** — `DELETE /_search/scroll` actually invalidates the
+context server-side (checked directly: a continuation attempt against a
+scroll id right after clearing it correctly 404s,
+`search_context_missing_exception`, not merely "the client stopped
+asking") — in all three cases that must trigger it:
+- normal end of scan (no pages left);
+- a mid-scan failure (tested with an unreachable `--target-url`, so
+  `_bulk` fails outright partway through — the scroll opened for that
+  run was confirmed cleared afterward, despite the run itself erroring);
+- SIGINT/SIGTERM (tested by sending each to a real run mid-scan — the
+  scroll was confirmed cleared both times). SIGTERM specifically was a
+  gap this round closed: the tool previously only listened for Ctrl-C
+  (SIGINT), so a process manager or container orchestrator stopping it
+  via SIGTERM — Rust's default disposition for a signal with no
+  installed handler — would have skipped cleanup entirely. Both are now
+  routed through the same interrupt flag and cleanup path.
 
 ## Attribution
 

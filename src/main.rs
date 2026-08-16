@@ -67,17 +67,23 @@ async fn run(args: Args) -> Result<()> {
         .await?;
     }
 
-    // A background task flips this the moment Ctrl-C is seen; the scan loop
-    // checks it between pages so a scroll that is open always gets cleared
-    // instead of leaking until its keep_alive expires.
+    // A background task flips this the moment Ctrl-C (SIGINT) or SIGTERM is
+    // seen; the scan loop checks it between pages so a scroll that is open
+    // always gets cleared instead of leaking until its keep_alive expires.
+    // Both signals, not just Ctrl-C: SIGTERM is what a process manager or
+    // container orchestrator sends to stop this tool, and with no handler
+    // installed for it, Rust's default disposition is to terminate
+    // immediately — skipping the cleanup block in `run` entirely, the exact
+    // leak this exists to prevent.
     let interrupted = Arc::new(AtomicBool::new(false));
     {
         let interrupted = interrupted.clone();
         tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                interrupted.store(true, Ordering::SeqCst);
-                eprintln!("\nxerj-seed: interrupted — finishing the current batch and clearing the scroll...");
-            }
+            wait_for_termination_signal().await;
+            interrupted.store(true, Ordering::SeqCst);
+            eprintln!(
+                "\nxerj-seed: interrupted — finishing the current batch and clearing the scroll..."
+            );
         });
     }
 
@@ -178,6 +184,32 @@ async fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
+/// Resolves on the first Ctrl-C (SIGINT) or, on Unix, SIGTERM — whichever
+/// comes first. A missing/unregistrable SIGTERM handler falls back to
+/// Ctrl-C alone rather than panicking; failing to catch a second signal
+/// kind is a smaller problem than crashing before the scroll is even open.
+#[cfg(unix)]
+async fn wait_for_termination_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match signal(SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        Err(e) => {
+            eprintln!("warning: could not install a SIGTERM handler ({e}) — only Ctrl-C will trigger cleanup");
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_termination_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 struct RunStats {
     scanned: u64,
     shipped: u64,
@@ -239,8 +271,14 @@ async fn scan_and_push(
         if interrupted.load(Ordering::SeqCst) {
             break;
         }
-        let (next_scroll_id, next_docs) =
-            scan::next_page(source, scroll_id, &args.scroll_keep_alive, args.max_retries).await?;
+        let (next_scroll_id, next_docs) = scan::next_page(
+            source,
+            &args.source_index,
+            scroll_id,
+            &args.scroll_keep_alive,
+            args.max_retries,
+        )
+        .await?;
         *scroll_id = next_scroll_id;
         docs = next_docs;
     }
