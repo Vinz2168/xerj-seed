@@ -10,7 +10,7 @@ for the general case.
 
 ```
 ┌──────────────┐   1. mapping/settings import (GET/PUT the index, once)  ┌──────────────┐
-│ ES-compatible│   2. full scan (PIT + search_after)                     │ ES-compatible│
+│ ES-compatible│   2. full scan (_search?scroll=… + _search/scroll)      │ ES-compatible│
 │    source    │ ───────────────────────────────────────────────────────▶│    target    │
 │ (xerj / ES / │   3. _bulk push (index, version_type: external,         │ (xerj / ES / │
 │  OpenSearch) │      version = source _seq_no)                          │  OpenSearch) │
@@ -72,7 +72,7 @@ xerj-seed \
 - `--max-retries` — how many consecutive transient failures (5xx / 429 /
   408 / transport error) to absorb with backoff before giving up (default
   `10`). See [Resumability](#resumability--no-checkpoint-file).
-- `--pit-keep-alive` — Point-in-Time TTL, renewed on every page (default
+- `--scroll-keep-alive` — scroll TTL, renewed on every page (default
   `5m`).
 - `--request-timeout-secs` — per-HTTP-request timeout (default `30`).
 
@@ -103,36 +103,39 @@ let the target's own dynamic mapping handle every field instead.
 
 Only one thing this tool does assumes xerj is on either end:
 `--enable-sync-after`, which calls `PUT /_xerj/wal_tap` — a native xerj
-endpoint. Everything else — the mapping/settings import, the PIT +
-`search_after` scan, the `_bulk` push — is the standard Elasticsearch wire
-protocol. `_bulk` (the target side) is genuinely universal — verified
-end-to-end against a real OpenSearch 3.7.0 target (see
-[Testing](#testing)) — and there's no reason to expect Elasticsearch to
-differ, since it's the same protocol OpenSearch forked from.
+endpoint. Everything else — the mapping/settings import, the scroll scan,
+the `_bulk` push — is the standard Elasticsearch wire protocol, and source
+and target genuinely don't need to be the same kind of cluster, or even
+related.
 
-**The source side's PIT is not universal, though**, and this is worth being
-precise about rather than optimistic: xerj-seed's scan uses Elasticsearch's
-PIT shape (`POST /{index}/_pit`, `DELETE /_pit` with `{"id": ...}`).
-Real Elasticsearch and xerj both speak that shape. **Real OpenSearch does
-not** — verified live against OpenSearch 3.7.0: `POST /{index}/_pit`
-returns `400`. OpenSearch's actual PIT API is `POST
-/{index}/_search/point_in_time`, closed via `DELETE /_search/point_in_time`
-with `{"pit_id": [...]}` (an array, under a different key) — a distinct
-enough shape that dialect-detection is a real follow-up, not a one-line
-fix. **So: a real Elasticsearch or xerj source works today; a real
-OpenSearch source does not yet** — only OpenSearch-as-*target* has been
-built and verified.
+That wasn't true of the first design, worth being upfront about: it used
+Point-in-Time (`POST /{index}/_pit` + `search_after`), which real
+Elasticsearch and xerj both speak but real OpenSearch does not — verified
+live, OpenSearch 3.7.0's actual PIT API is a differently-shaped
+`POST /{index}/_search/point_in_time`. The scan now uses `_scroll`
+instead (`POST /{index}/_search?scroll=…`, `POST /_search/scroll`,
+`DELETE /_search/scroll`) specifically because it predates that fork and
+is live-verified byte-for-byte identical on xerj and on a real OpenSearch
+3.7.0 node, `_seq_no` included. See `scan.rs`'s module docs for the detail.
 
 Concretely, today:
 
 ```sh
-# Elasticsearch → OpenSearch (e.g. moving off an Elastic-licensed cluster) — works
+# Elasticsearch → OpenSearch (e.g. moving off an Elastic-licensed cluster)
 xerj-seed \
   --source-url  https://es-cluster.internal:9200 \
   --source-index orders \
   --source-auth "ApiKey $ES_API_KEY" \
   --target-url  https://os-cluster.internal:9200 \
   --target-auth "Basic $(printf '%s' 'admin:pass' | base64)"
+
+# OpenSearch → xerj (or Elasticsearch — same call, different --target-url)
+xerj-seed \
+  --source-url  https://os-cluster.internal:9200 \
+  --source-index products \
+  --source-auth "Basic $(printf '%s' 'admin:pass' | base64)" \
+  --target-url  https://es-cluster.internal:9200 \
+  --target-auth "ApiKey $ES_API_KEY"
 
 # Same-engine migration (cluster resize, region move, version upgrade
 # via reindex-to-new-cluster) — no --enable-sync-after either way
@@ -142,30 +145,24 @@ xerj-seed \
   --target-url  https://es-new.internal:9200
 ```
 
-A real OpenSearch cluster as `--source-url` is not supported yet (see
-above) — that's a real gap, tracked as a follow-up, not a "should work but
-untested" claim.
+The first two are live-verified in both directions (see
+[Testing](#testing)); the third wasn't run as its own leg, but is the same
+call with the same engine on both ends, and each end individually is
+already covered above.
 
-None of these pass `--enable-sync-after` — there's nothing xerj-specific to
-arm. If you *do* pass it with a source that isn't xerj, `PUT
-/_xerj/wal_tap` has nowhere to land there. Live-verified against a real
-OpenSearch 3.7.0 node: `400`, `{"error":"no handler found for uri
-[/_xerj/wal_tap] and method [PUT]"}` — its generic unknown-route response
-(not a `404`, worth knowing if you're expecting Elasticsearch's
-convention; a real Elasticsearch source, which unlike OpenSearch does get
-as far as this step, may well answer differently). Either way, this is
-the response the same retry/fail-fast policy the rest of this tool uses
-(see [Attribution](#attribution)) treats as a non-retryable failure, and
-`main.rs` wraps it before propagating — naming the document count already
-shipped and stating plainly that the migration is unaffected, rather than
-surfacing a bare HTTP error or leaving you to guess whether anything needs
-cleaning up:
+None of these pass `--enable-sync-after` — there's nothing xerj-specific
+to arm. If you *do* pass it with a source that isn't xerj, `PUT
+/_xerj/wal_tap` has nowhere to land there, and this is where the migration
+already having fully succeeded by that point matters: the failure is
+reported plainly, not left to bubble up as a bare HTTP error. Captured
+live, start to finish, source = real OpenSearch 3.7.0:
 
 ```
-xerj-seed: done. scanned=110 shipped=110 conflicts=0 rejected=0
+xerj-seed: done. scanned=50 shipped=50 conflicts=0 rejected=0
 xerj-seed: arming wal_tap on the source for incremental sync...
-error: document migration succeeded (110 document(s) shipped to the target) — but
---enable-sync-after failed: enable wal_tap: permanent failure, not retrying: HTTP 400: ...
+error: document migration succeeded (50 document(s) shipped to the target) — but
+--enable-sync-after failed: enable wal_tap: permanent failure, not retrying: HTTP 400
+Bad Request: {"error":"no handler found for uri [/_xerj/wal_tap] and method [PUT]"}
 
 --enable-sync-after is XERJ-specific: it calls PUT /_xerj/wal_tap on --source-url, a
 native endpoint that only a XERJ node exposes. If --source-url points to a real
@@ -174,12 +171,10 @@ migrated data on the target is unaffected either way. Rerun without --enable-syn
 or set up your own incremental sync for that source engine.
 ```
 
-The `HTTP 400: ...` line above was captured live (`PUT /_xerj/wal_tap`
-against real OpenSearch); the two lines around it are `main.rs`'s own
-wrapping, exercised by unit-equivalent reasoning rather than one single
-live run reaching this exact point — [today's PIT gap](#beyond-xerj-generic-es-compatible-migration)
-means a real OpenSearch source never gets this far (it fails earlier, at
-the scan), and no Elasticsearch cluster was reachable while writing this.
+(That `HTTP 400` — not `404` — is OpenSearch's own generic unknown-route
+response; worth knowing if you were expecting Elasticsearch's convention. A
+real Elasticsearch source may well answer differently, and wasn't
+reachable to check while writing this — see [Testing](#testing).)
 
 ## Resumability — no checkpoint file
 
@@ -187,10 +182,16 @@ the scan), and no Elasticsearch cluster was reachable while writing this.
 interrupted (Ctrl-C, crash, network partition), just run it again from the
 beginning: the push is idempotent by construction — every document is sent
 as `action: index, version_type: external, version: <source _seq_no>`, so
-the target keeps whichever write carries the highest version for each
-`_id`. Re-sending a document the target already has at the same-or-newer
-version is a no-op (a benign `version_conflict_engine_exception`, counted
-and reported, not an error). This trades resume efficiency (a rerun rescans
+the target never ends up with a duplicate; a full rerun always converges to
+the same content. Live-verified, twice: a full rerun after a successful run
+reports the same document count on the target either way it can resolve —
+against a real OpenSearch target as a genuine `version_conflict_engine_exception`
+per re-sent document (counted, reported, not treated as an error), and
+against xerj-as-target as an accepted same-version overwrite instead (no
+conflict counted, but the content — and the fact that nothing duplicated —
+is identical either way). Which of the two happens is the target engine's
+own external-versioning comparison, not something this tool controls or
+needs to; both are safe. This trades resume efficiency (a rerun rescans
 everything) for simplicity (no checkpoint format to get wrong, no
 partially-applied state to reason about) — deliberately.
 
@@ -224,43 +225,45 @@ cargo build --release
 `cargo test` runs the unit tests (URL validation, redaction, the system-
 index guard).
 
-The tool was also exercised end-to-end against a real xerj source (built
-from `xerj-org/xerj` `main`, which has `wal_tap`) and a real **OpenSearch
-3.7.0** target container, twice independently (including a rerun after an
-unrelated local Docker restart, to also exercise the "rerun from scratch"
-path this tool's idempotency is built around). Both runs confirmed: every
-document (115–120, varied per run) lands on the target, `GET
-/_xerj/wal_tap` on the source reports `enabled: true` with the right
-`indices`/`target_url` after the run, and a write made on the source
-*after* the run propagates to the target on its own (`wal_tap`'s own
-`_stats` reporting `healthy: true`, `lag_seq: 0`) with no further action.
-`scripts/e2e-smoke-test.sh` captures this same sequence in reusable form.
+The tool was exercised end-to-end against real clusters throughout —
+xerj (built from `xerj-org/xerj` `main`, which has `wal_tap`) and a real
+**OpenSearch 3.7.0** — in every source/target combination between the two:
 
-Mapping/settings import was verified the same way: an index created on the
-xerj source with an explicit mapping (a `keyword` field and a plain `text`
-field with no dynamic `.keyword` sub-field), migrated to the OpenSearch
-target, came back with that exact mapping — not what OpenSearch's own
-dynamic-mapping defaults would have inferred (which adds a `.keyword`
-sub-field to a `text`-looking string automatically). A second run against
-the same already-created target index confirmed the skip path: no mapping
-call made, the one document re-sent resolved as a version conflict rather
-than a duplicate.
+- **xerj → OpenSearch**, twice independently (including a rerun after an
+  unrelated local Docker restart, to also exercise the "rerun from
+  scratch" path this tool's idempotency is built around): every document
+  lands on the target, `GET /_xerj/wal_tap` on the source reports
+  `enabled: true` with the right `indices`/`target_url` after the run,
+  and a write made on the source *after* the run propagates to the
+  target on its own (`wal_tap`'s own `_stats` reporting `healthy: true`,
+  `lag_seq: 0`) with no further action. `scripts/e2e-smoke-test.sh`
+  captures this sequence in reusable form.
+- **OpenSearch → xerj** (the direction PIT couldn't reach — see
+  [Beyond XERJ](#beyond-xerj-generic-es-compatible-migration)): 50
+  documents scanned and shipped via `_scroll`, a rerun against the
+  already-created target index correctly skipped the mapping import and
+  reported the same 50/50 the second time (no duplication — see
+  [Resumability](#resumability--no-checkpoint-file) for what "reports
+  the same count" resolves to on each target engine), and
+  `--enable-sync-after` against this real non-xerj source produced the
+  exact failure message quoted in that section, captured from one single
+  live run start to finish.
 
-The [Beyond XERJ](#beyond-xerj-generic-es-compatible-migration) section's
-claims were checked directly rather than assumed: `_bulk` against real
-OpenSearch works (above); a real OpenSearch node as `--source-url` was
-tried and fails cleanly at the PIT-open step (`HTTP 400`, the response
-body quoted verbatim, not a panic or a hang) because OpenSearch's real PIT
-API has a different shape than Elasticsearch's — a genuine, now-documented
-gap rather than an assumption.
+Mapping/settings import was verified with an index created on the source
+with an explicit mapping (a `keyword` field and a plain `text` field with
+no dynamic `.keyword` sub-field): it came back on the target with that
+exact mapping, not what the target's own dynamic-mapping defaults would
+have inferred (OpenSearch in particular adds a `.keyword` sub-field to a
+`text`-looking string automatically — this is exactly the divergence the
+feature exists to prevent).
 
 A leg against a real **Elasticsearch** cluster (as either source or
 target) was attempted but not completed — the local Docker daemon used to
 test this could not pull the image (a registry/network issue in that
-environment, unrelated to this tool). `_bulk`/`_search` as the target side
-needs is the same wire format Elasticsearch serves, so there's no reason
-to expect different behavior there — but, per the section above, that is
-now explicitly flagged as unverified rather than implied by omission.
+environment, unrelated to this tool). `_bulk`/`_search`/`_scroll` are the
+same wire format Elasticsearch serves — OpenSearch forked from it and
+kept scroll unchanged — so there's no reason to expect different behavior
+there, but that is flagged as unverified rather than implied by omission.
 Contributions running that leg are welcome.
 
 ## Attribution

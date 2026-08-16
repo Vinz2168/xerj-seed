@@ -68,7 +68,7 @@ async fn run(args: Args) -> Result<()> {
     }
 
     // A background task flips this the moment Ctrl-C is seen; the scan loop
-    // checks it between pages so a PIT that is open always gets closed
+    // checks it between pages so a scroll that is open always gets cleared
     // instead of leaking until its keep_alive expires.
     let interrupted = Arc::new(AtomicBool::new(false));
     {
@@ -76,26 +76,34 @@ async fn run(args: Args) -> Result<()> {
         tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
                 interrupted.store(true, Ordering::SeqCst);
-                eprintln!("\nxerj-seed: interrupted — finishing the current batch and closing the PIT...");
+                eprintln!("\nxerj-seed: interrupted — finishing the current batch and clearing the scroll...");
             }
         });
     }
 
     // ── Scan + push ─────────────────────────────────────────────────────
-    let pit_id = scan::open_pit(
+    // Opening a scroll returns its id AND the first page in one call —
+    // unlike PIT, there's no separate "open" step before the first read.
+    let (scroll_id, first_page) = scan::open_scroll(
         &source,
         &args.source_index,
-        &args.pit_keep_alive,
+        &args.scroll_keep_alive,
+        args.batch_size,
         args.max_retries,
     )
     .await?;
+    // Tracks the most recently returned scroll id, updated as scan_and_push
+    // pages through — ES/OpenSearch recommend always using the latest one,
+    // both to continue and to clear, rather than assuming it never changes.
+    let mut scroll_id = scroll_id;
 
-    let outcome = scan_and_push(&args, &source, &target, &pit_id, &interrupted).await;
+    let outcome =
+        scan_and_push(&args, &source, &target, &mut scroll_id, first_page, &interrupted).await;
 
-    // Cleanup block: close the PIT whatever happened above (success, error,
-    // or Ctrl-C), matching wal_tap.rs's own posture that a best-effort
-    // cleanup must not depend on the happy path.
-    scan::close_pit(&source, &pit_id).await;
+    // Cleanup block: clear the scroll whatever happened above (success,
+    // error, or Ctrl-C), matching wal_tap.rs's own posture that a
+    // best-effort cleanup must not depend on the happy path.
+    scan::clear_scroll(&source, &scroll_id).await;
 
     let stats = outcome?;
 
@@ -182,10 +190,10 @@ async fn scan_and_push(
     args: &Args,
     source: &EsClient,
     target: &EsClient,
-    pit_id: &str,
+    scroll_id: &mut String,
+    first_page: Vec<scan::ScannedDoc>,
     interrupted: &Arc<AtomicBool>,
 ) -> Result<RunStats> {
-    let mut search_after: Option<String> = None;
     let mut scanned = 0u64;
     let mut shipped = 0u64;
     let mut conflicts = 0u64;
@@ -194,27 +202,18 @@ async fn scan_and_push(
     let mut batch_no = 0u64;
     let started = Instant::now();
 
+    // The first page came back with `open_scroll` itself; every later page
+    // comes from `scan::next_page`. Same body from here on either way.
+    let mut docs = first_page;
     loop {
         if interrupted.load(Ordering::SeqCst) {
             break;
         }
-
-        let (docs, next_after) = scan::next_page(
-            source,
-            pit_id,
-            &args.pit_keep_alive,
-            args.batch_size,
-            search_after.as_deref(),
-            args.max_retries,
-        )
-        .await?;
-
         if docs.is_empty() {
             break;
         }
         batch_no += 1;
         scanned += docs.len() as u64;
-        search_after = next_after;
 
         let result = push::push_batch(target, &args.source_index, &docs, args.max_retries).await?;
         shipped += result.shipped;
@@ -236,6 +235,14 @@ async fn scan_and_push(
              rejected={rejected} ({:.1}s elapsed)",
             started.elapsed().as_secs_f64()
         );
+
+        if interrupted.load(Ordering::SeqCst) {
+            break;
+        }
+        let (next_scroll_id, next_docs) =
+            scan::next_page(source, scroll_id, &args.scroll_keep_alive, args.max_retries).await?;
+        *scroll_id = next_scroll_id;
+        docs = next_docs;
     }
 
     Ok(RunStats {

@@ -1,11 +1,12 @@
 use clap::Parser;
 
-/// xerj-seed — one-shot seed tool for xerj's wal_tap.
+/// xerj-seed — one-shot index migration between ES-compatible clusters.
 ///
-/// Fully scans a XERJ source index, writes every document to an ES-compatible
-/// target (another xerj node, OpenSearch, or Elasticsearch), and — optionally
-/// — arms `/_xerj/wal_tap` on the source when done, so the target keeps
-/// receiving writes incrementally without further intervention.
+/// Fully scans a source index (Elasticsearch, OpenSearch, or xerj) and
+/// writes every document to an ES-compatible target, and — optionally, and
+/// only when the source is xerj — arms `/_xerj/wal_tap` on the source when
+/// done, so the target keeps receiving writes incrementally without further
+/// intervention.
 ///
 /// No state is kept between runs. If the process is interrupted, rerun it
 /// from scratch: the push is idempotent (index action, version_type
@@ -14,7 +15,7 @@ use clap::Parser;
 #[derive(Debug, Parser)]
 #[command(name = "xerj-seed", version, about, long_about = None)]
 pub struct Args {
-    /// Base URL of the source XERJ node, e.g. https://source:9200
+    /// Base URL of the source cluster, e.g. https://source:9200
     #[arg(long)]
     pub source_url: String,
 
@@ -47,9 +48,9 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub enable_sync_after: bool,
 
-    /// PIT keep_alive, e.g. "5m". Renewed on every _search request.
+    /// Scroll keep_alive, e.g. "5m". Renewed on every page.
     #[arg(long, default_value = "5m")]
-    pub pit_keep_alive: String,
+    pub scroll_keep_alive: String,
 
     /// Per-HTTP-request timeout in seconds.
     #[arg(long, default_value_t = 30)]

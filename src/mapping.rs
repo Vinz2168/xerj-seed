@@ -145,7 +145,7 @@ async fn create_target_index(
 ///
 /// Errors out (stopping the whole run) when the source index doesn't exist
 /// at all: that's a configuration mistake worth catching before an empty
-/// PIT scan makes it look like the index was just empty.
+/// scroll scan makes it look like the index was just empty.
 pub async fn import_mapping_if_needed(
     source: &EsClient,
     target: &EsClient,
