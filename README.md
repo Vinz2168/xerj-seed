@@ -145,10 +145,11 @@ xerj-seed \
   --target-url  https://es-new.internal:9200
 ```
 
-The first two are live-verified in both directions (see
-[Testing](#testing)); the third wasn't run as its own leg, but is the same
-call with the same engine on both ends, and each end individually is
-already covered above.
+All three source/target roles are live-verified — real Elasticsearch
+7.10.2 and real OpenSearch 3.7.0, each as both source and target, into and
+out of xerj (see [Testing](#testing)). Elasticsearch ↔ OpenSearch directly
+wasn't run as its own leg, but is the same call with each end individually
+already covered.
 
 None of these pass `--enable-sync-after` — there's nothing xerj-specific
 to arm. If you *do* pass it with a source that isn't xerj, `PUT
@@ -171,10 +172,18 @@ migrated data on the target is unaffected either way. Rerun without --enable-syn
 or set up your own incremental sync for that source engine.
 ```
 
-(That `HTTP 400` — not `404` — is OpenSearch's own generic unknown-route
-response; worth knowing if you were expecting Elasticsearch's convention. A
-real Elasticsearch source may well answer differently, and wasn't
-reachable to check while writing this — see [Testing](#testing).)
+The exact response varies by engine — worth knowing rather than assuming
+one shape, since this tool deliberately doesn't try to match a specific
+code. Both captured live, `PUT /_xerj/wal_tap` against a real source:
+
+| Source engine | Status | Body |
+|---|---|---|
+| OpenSearch 3.7.0 | `400` | `{"error":"no handler found for uri [/_xerj/wal_tap] and method [PUT]"}` |
+| Elasticsearch 7.10.2 | `405` | `{"error":"Incorrect HTTP method for uri [/_xerj/wal_tap] and method [PUT], allowed: [POST]"}` |
+
+Either way, it's a non-retryable status, so xerj-seed's retry/fail-fast
+policy (see [Attribution](#attribution)) reports it immediately rather
+than backing off and retrying a request that will never succeed.
 
 ## Resumability — no checkpoint file
 
@@ -226,8 +235,9 @@ cargo build --release
 index guard).
 
 The tool was exercised end-to-end against real clusters throughout —
-xerj (built from `xerj-org/xerj` `main`, which has `wal_tap`) and a real
-**OpenSearch 3.7.0** — in every source/target combination between the two:
+xerj (built from `xerj-org/xerj` `main`, which has `wal_tap`), a real
+**OpenSearch 3.7.0**, and a real **Elasticsearch 7.10.2** — in every
+source/target combination among the three:
 
 - **xerj → OpenSearch**, twice independently (including a rerun after an
   unrelated local Docker restart, to also exercise the "rerun from
@@ -248,23 +258,25 @@ xerj (built from `xerj-org/xerj` `main`, which has `wal_tap`) and a real
   `--enable-sync-after` against this real non-xerj source produced the
   exact failure message quoted in that section, captured from one single
   live run start to finish.
+- **Elasticsearch → xerj**: 40 documents scanned and shipped, target
+  mapping confirmed to match the source's explicit mapping exactly
+  (`keyword` field, plain `text` field, no dynamic sub-field added), and
+  `--enable-sync-after` against this real Elasticsearch source produced
+  the `405` response quoted in the table above — a third distinct status
+  code from a third engine, on top of OpenSearch's `400`.
+- **xerj → Elasticsearch**: one document, confirmed present on the target
+  (`_version: 0`, matching the source's `_seq_no`, after allowing for
+  Elasticsearch's ~1s default `refresh_interval` — `_count` right after
+  the write undercounts until the next refresh, which is Elasticsearch's
+  own behavior, not this tool's).
 
-Mapping/settings import was verified with an index created on the source
-with an explicit mapping (a `keyword` field and a plain `text` field with
-no dynamic `.keyword` sub-field): it came back on the target with that
-exact mapping, not what the target's own dynamic-mapping defaults would
-have inferred (OpenSearch in particular adds a `.keyword` sub-field to a
-`text`-looking string automatically — this is exactly the divergence the
-feature exists to prevent).
-
-A leg against a real **Elasticsearch** cluster (as either source or
-target) was attempted but not completed — the local Docker daemon used to
-test this could not pull the image (a registry/network issue in that
-environment, unrelated to this tool). `_bulk`/`_search`/`_scroll` are the
-same wire format Elasticsearch serves — OpenSearch forked from it and
-kept scroll unchanged — so there's no reason to expect different behavior
-there, but that is flagged as unverified rather than implied by omission.
-Contributions running that leg are welcome.
+Mapping/settings import was verified against both non-xerj engines: an
+index created on the source with an explicit mapping (a `keyword` field
+and a plain `text` field with no dynamic `.keyword` sub-field) came back
+on the target with that exact mapping, not what the target's own
+dynamic-mapping defaults would have inferred (OpenSearch in particular
+adds a `.keyword` sub-field to a `text`-looking string automatically —
+this is exactly the divergence the feature exists to prevent).
 
 ## Attribution
 
