@@ -138,12 +138,33 @@ live-verified up to 5 pages against a 235-document index. Real
 Elasticsearch and OpenSearch both persist the flag for the scroll's whole
 lifetime, as documented (also live-verified, 4 pages on OpenSearch 3.7.0,
 `_seq_no` present throughout — this is xerj-specific, not a protocol
-limitation). Filed as [xerj-org/xerj#428](https://github.com/xerj-org/xerj/issues/428);
-worked around in the
-meantime with one `_mget?seq_no_primary_term=true` call per affected page
-(carrying only that page's ids, not the whole page's documents again) —
-see `backfill_missing_seq_no` in `scan.rs`. Harmless overhead everywhere
-else, since it only fires when a page is actually missing `_seq_no`.
+limitation). Filed as [xerj-org/xerj#428](https://github.com/xerj-org/xerj/issues/428).
+
+A fix was attempted upstream ([xerj-org/xerj#431](https://github.com/xerj-org/xerj/pull/431))
+and is **not merged** — independent review found that resolving `_seq_no`
+live at continuation-page render time, while `_source` is served from the
+scroll's point-in-time snapshot, can pair an *old* body with a *new*
+sequence number if a write lands in between. Fed back as
+`if_seq_no`/`version_type: external` — exactly how this tool uses it —
+that stale body passes optimistic-concurrency checks and silently
+overwrites the newer write. Worse than the missing field it would have
+replaced. The maintainer marked it `DO NOT MERGE` and is tracking a
+proper engine-level fix; see the PR for the full trace.
+
+That finding applies equally to a naive client-side workaround, so this
+tool's own fix took it into account: `backfill_missing_seq_no` in
+`scan.rs` still makes one `_mget?seq_no_primary_term=true` call per
+affected page (carrying only that page's missing ids, not the whole
+page again), but now takes **both `_seq_no` and `_source`** from that
+same `_mget` response, rather than keeping the scroll page's `_source`
+next to a freshly-fetched `_seq_no`. A single-document `_mget` is a
+direct read, not xerj's gather-then-resolve-later scroll path, so the
+two values it returns are paired consistently. Live-verified the exact
+race: a document updated between its scroll page and the backfill call
+now correctly ships with the *new* content and the *new* version
+together — reconstructing the old (pre-fix) behavior side by side
+confirmed it would have shipped the old content stamped with the new
+version, the same torn pairing #431 was drafted for.
 
 Concretely, today:
 
@@ -315,6 +336,18 @@ pages was exactly the source's 235 ids, no more, no fewer. This is also
 how the `_seq_no`-dropped-after-page-one bug above ([#428](https://github.com/xerj-org/xerj/issues/428))
 surfaced: earlier testing never scanned more than ~2 pages, so it was
 never caught before this round.
+
+**The torn-read fix** (see [Beyond XERJ](#beyond-xerj-generic-es-compatible-migration)
+for what it addresses) was verified against the exact race it targets: a
+100-document scroll, one document updated in the gap between its scroll
+page being read and the `_mget` backfill call resolving its `_seq_no`.
+Reconstructing what the earlier (pre-fix) shape of `backfill_missing_seq_no`
+would have shipped for that document — the scroll page's `_source` next to
+the freshly-backfilled `_seq_no` — showed the stale content paired with the
+new version; the shipped fix instead takes both from the same `_mget`
+response and correctly propagated the update's real, current content. The
+same 100-document run (5 pages) also confirms the fix doesn't cost
+anything on the ordinary path: `scanned=100 shipped=100` end to end.
 
 **Scroll cleanup** — `DELETE /_search/scroll` actually invalidates the
 context server-side (checked directly: a continuation attempt against a

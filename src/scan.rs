@@ -32,6 +32,25 @@
 //! link. This workaround is harmless overhead everywhere else, since it
 //! only fires when `_seq_no` is actually missing from a page.
 //!
+//! **Why the backfill also replaces `_source`, not only `_seq_no`.** An
+//! upstream attempt at the same bug (xerj-org/xerj#431, not merged — see
+//! the README) revealed a sharper failure mode than a missing field:
+//! resolving `_seq_no` from the live version map while serving `_source`
+//! from a point-in-time snapshot can pair a document's *old* body with its
+//! *new* sequence number, if a write lands in between. Fed back as
+//! `version_type: external` on the target — exactly what this tool does —
+//! that stale body is accepted as the highest-versioned write, silently
+//! discarding whatever the real, newer document was. [`backfill_missing_seq_no`]
+//! avoids constructing that pairing itself: when a page is missing
+//! `_seq_no`, it takes `_source` **from the same `_mget` response** the
+//! `_seq_no` backfill comes from, rather than keeping the scroll page's
+//! (potentially now-stale) `_source` next to a freshly-fetched `_seq_no`.
+//! A single-document `_mget` lookup is a direct read, not a
+//! gather-then-resolve-later pass over a list, so the two values it
+//! returns come from the same read — the same property real Elasticsearch
+//! gets from a pinned segment reader, applied here per-document at the
+//! client instead of per-scroll at the engine.
+//!
 //! The *version* pushed to the target is still the real `_seq_no` — see
 //! `wal_tap.rs`'s reasoning in the README's Attribution section.
 
@@ -99,11 +118,19 @@ fn extract_scroll_id(resp_body: &Value) -> Result<String> {
         .with_context(|| format!("response carried no _scroll_id: {resp_body}"))
 }
 
-/// Resolve every [`RawHit`] to a [`ScannedDoc`], backfilling `_seq_no` via
-/// `_mget?seq_no_primary_term=true` for any hit that came back without one
-/// — see the module docs' "real xerj bug" section. One `_mget` call per
-/// page that needs it, carrying only the ids that are actually missing,
-/// not the whole page.
+/// A backfilled doc's `_seq_no` and `_source`, read together from the same
+/// `_mget` response entry — see the module docs on why both, not just the
+/// sequence number, come from there.
+struct Backfilled {
+    seq_no: u64,
+    source: Value,
+}
+
+/// Resolve every [`RawHit`] to a [`ScannedDoc`], backfilling `_seq_no`
+/// (**and** `_source`, together) via `_mget?seq_no_primary_term=true` for
+/// any hit that came back without a `_seq_no` — see the module docs' "real
+/// xerj bug" section. One `_mget` call per page that needs it, carrying
+/// only the ids that are actually missing, not the whole page.
 async fn backfill_missing_seq_no(
     source: &EsClient,
     index: &str,
@@ -116,7 +143,7 @@ async fn backfill_missing_seq_no(
         .map(|h| h.id.as_str())
         .collect();
 
-    let mut backfilled: HashMap<String, u64> = HashMap::new();
+    let mut backfilled: HashMap<String, Backfilled> = HashMap::new();
     if !missing_ids.is_empty() {
         let path = format!("{index}/_mget?seq_no_primary_term=true");
         let body = json!({ "ids": missing_ids });
@@ -156,27 +183,41 @@ async fn backfill_missing_seq_no(
             ) else {
                 continue;
             };
-            backfilled.insert(id.to_string(), seq_no);
+            // The whole point: this _source is read in the same _mget
+            // response as seq_no, not carried over from the scroll page —
+            // see the module docs.
+            let doc_source = doc.get("_source").cloned().unwrap_or_else(|| json!({}));
+            backfilled.insert(
+                id.to_string(),
+                Backfilled {
+                    seq_no,
+                    source: doc_source,
+                },
+            );
         }
     }
 
     hits.into_iter()
-        .map(|h| {
-            let seq_no = match h.seq_no {
-                Some(s) => s,
-                None => *backfilled.get(&h.id).with_context(|| {
+        .map(|h| match h.seq_no {
+            Some(seq_no) => Ok(ScannedDoc {
+                id: h.id,
+                seq_no,
+                source: h.source,
+            }),
+            None => {
+                let b = backfilled.get(&h.id).with_context(|| {
                     format!(
                         "hit {:?} carried no _seq_no and the _mget backfill didn't resolve one \
                          either",
                         h.id
                     )
-                })?,
-            };
-            Ok(ScannedDoc {
-                id: h.id,
-                seq_no,
-                source: h.source,
-            })
+                })?;
+                Ok(ScannedDoc {
+                    id: h.id,
+                    seq_no: b.seq_no,
+                    source: b.source.clone(),
+                })
+            }
         })
         .collect()
 }
