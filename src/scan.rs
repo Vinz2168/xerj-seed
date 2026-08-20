@@ -18,38 +18,54 @@
 //! given, and the reason the mapping-import step and this scan both run
 //! before `--enable-sync-after` arms `wal_tap`, not after.
 //!
-//! **A real xerj bug this module works around.** `seq_no_primary_term:
-//! true` on the scroll-opening `_search?scroll=...` request is honored for
-//! that first page, but xerj's `_search/scroll` continuation handler drops
-//! it — every page after the first comes back with no `_seq_no` on a xerj
-//! source, live-verified up to 5 pages. Real Elasticsearch and OpenSearch
-//! both persist the flag for the scroll's lifetime, as documented (checked
-//! live against OpenSearch 3.7.0, 4 pages, `_seq_no` present throughout);
-//! only xerj drops it. [`backfill_missing_seq_no`] papers over this with
-//! one `_mget?seq_no_primary_term=true` call per page that needs it — not
-//! per document — rather than failing the whole scan. Filed as a bug
-//! against xerj-org/xerj; see the README's Testing section for the issue
-//! link. This workaround is harmless overhead everywhere else, since it
-//! only fires when `_seq_no` is actually missing from a page.
+//! **A real xerj bug this module works around — fixed upstream as of
+//! v1.0.0-rc.19, kept here as a compatibility shim.** `seq_no_primary_term:
+//! true` on the scroll-opening `_search?scroll=...` request used to be
+//! honored for the first page only; xerj's `_search/scroll` continuation
+//! handler dropped it on every later page, live-verified up to 5 pages on
+//! affected releases. Real Elasticsearch and OpenSearch both persisted the
+//! flag for the scroll's lifetime throughout (checked live against
+//! OpenSearch 3.7.0, 4 pages, `_seq_no` present throughout); only xerj
+//! dropped it. Filed as [xerj-org/xerj#428](https://github.com/xerj-org/xerj/issues/428),
+//! closed by [xerj-org/xerj#499](https://github.com/xerj-org/xerj/pull/499)
+//! (merged 2026-08-19, commit `7a89134`, shipped in v1.0.0-rc.19): xerj now
+//! captures `seq_no`/`version` on `executor::Hit` at the same read that
+//! resolves `_source` inside `Index::search`, snapshots them into
+//! `ScrollContext` at scroll-open, and every continuation page serves from
+//! that snapshot — no more render-time re-lookup, so no more dropped field.
+//! [`backfill_missing_seq_no`] is left in place rather than removed: it
+//! only fires when a page actually comes back without `_seq_no`, which a
+//! fixed xerj (rc.19+) will never do, so against a current xerj it's a
+//! dead branch at zero cost. It still matters against any xerj source
+//! running an older release, or a fork that regresses this — this tool has
+//! no way to know the source's exact version, so it keeps the fallback
+//! rather than assume every source has upgraded. One
+//! `_mget?seq_no_primary_term=true` call per page that needs it — not per
+//! document — rather than failing the whole scan.
 //!
 //! **Why the backfill also replaces `_source`, not only `_seq_no`.** An
-//! upstream attempt at the same bug (xerj-org/xerj#431, not merged — see
-//! the README) revealed a sharper failure mode than a missing field:
-//! resolving `_seq_no` from the live version map while serving `_source`
-//! from a point-in-time snapshot can pair a document's *old* body with its
-//! *new* sequence number, if a write lands in between. Fed back as
-//! `version_type: external` on the target — exactly what this tool does —
-//! that stale body is accepted as the highest-versioned write, silently
-//! discarding whatever the real, newer document was. [`backfill_missing_seq_no`]
-//! avoids constructing that pairing itself: when a page is missing
-//! `_seq_no`, it takes `_source` **from the same `_mget` response** the
-//! `_seq_no` backfill comes from, rather than keeping the scroll page's
-//! (potentially now-stale) `_source` next to a freshly-fetched `_seq_no`.
-//! A single-document `_mget` lookup is a direct read, not a
+//! upstream attempt at the same bug (xerj-org/xerj#431) revealed a sharper
+//! failure mode than a missing field: resolving `_seq_no` from the live
+//! version map while serving `_source` from a point-in-time snapshot can
+//! pair a document's *old* body with its *new* sequence number, if a write
+//! lands in between. Fed back as `version_type: external` on the target —
+//! exactly what this tool does — that stale body is accepted as the
+//! highest-versioned write, silently discarding whatever the real, newer
+//! document was. #431 was never merged over this (the maintainer marked it
+//! `DO NOT MERGE`); the real fix landed separately via the root-cause issue
+//! [xerj-org/xerj#440](https://github.com/xerj-org/xerj/issues/440), also
+//! closed by #499, which reads `seq_no`/`version` and `_source` from the
+//! same pass instead of patching the API layer. [`backfill_missing_seq_no`]
+//! took the same lesson for its own client-side fallback: when a page is
+//! missing `_seq_no`, it takes `_source` **from the same `_mget` response**
+//! the `_seq_no` backfill comes from, rather than keeping the scroll
+//! page's (potentially now-stale) `_source` next to a freshly-fetched
+//! `_seq_no`. A single-document `_mget` lookup is a direct read, not a
 //! gather-then-resolve-later pass over a list, so the two values it
 //! returns come from the same read — the same property real Elasticsearch
-//! gets from a pinned segment reader, applied here per-document at the
-//! client instead of per-scroll at the engine.
+//! gets from a pinned segment reader, and the same property xerj's own
+//! fix now gets at the engine level, applied here per-document at the
+//! client as a fallback instead of per-scroll at the engine.
 //!
 //! The *version* pushed to the target is still the real `_seq_no` — see
 //! `wal_tap.rs`'s reasoning in the README's Attribution section.
@@ -72,8 +88,9 @@ pub struct ScannedDoc {
 
 /// A hit as read straight off a `_search`/scroll response, before the
 /// `_seq_no` fallback. `seq_no` is `None` when the page didn't carry it —
-/// see the module docs for why that's a real, expected case on a xerj
-/// source, not necessarily a malformed response.
+/// see the module docs: expected on a xerj source older than v1.0.0-rc.19,
+/// not necessarily a malformed response; a current xerj source shouldn't
+/// hit this at all.
 struct RawHit {
     id: String,
     seq_no: Option<u64>,
@@ -129,8 +146,10 @@ struct Backfilled {
 /// Resolve every [`RawHit`] to a [`ScannedDoc`], backfilling `_seq_no`
 /// (**and** `_source`, together) via `_mget?seq_no_primary_term=true` for
 /// any hit that came back without a `_seq_no` — see the module docs' "real
-/// xerj bug" section. One `_mget` call per page that needs it, carrying
-/// only the ids that are actually missing, not the whole page.
+/// xerj bug" section (fixed upstream in v1.0.0-rc.19; kept here as a
+/// compatibility fallback for older sources). One `_mget` call per page
+/// that needs it, carrying only the ids that are actually missing, not the
+/// whole page.
 async fn backfill_missing_seq_no(
     source: &EsClient,
     index: &str,

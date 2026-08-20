@@ -130,32 +130,47 @@ this way is what makes the combination correct: anything the scan might
 have missed is, by construction, either already reflected by the time
 the tap turns on or covered by the tap itself from that moment forward.
 
-**A real xerj bug found and worked around while verifying this.**
-`seq_no_primary_term: true` on the scroll-opening request is honored for
-page one, but xerj's `_search/scroll` continuation handler silently drops
-it — every page after the first came back with no `_seq_no` at all,
-live-verified up to 5 pages against a 235-document index. Real
+**A real xerj bug found and worked around while verifying this — fixed
+upstream as of v1.0.0-rc.19.** `seq_no_primary_term: true` on the
+scroll-opening request was honored for page one, but xerj's
+`_search/scroll` continuation handler silently dropped it — every page
+after the first came back with no `_seq_no` at all, live-verified up to 5
+pages against a 235-document index on affected releases. Real
 Elasticsearch and OpenSearch both persist the flag for the scroll's whole
 lifetime, as documented (also live-verified, 4 pages on OpenSearch 3.7.0,
-`_seq_no` present throughout — this is xerj-specific, not a protocol
+`_seq_no` present throughout — this was xerj-specific, not a protocol
 limitation). Filed as [xerj-org/xerj#428](https://github.com/xerj-org/xerj/issues/428).
 
-A fix was attempted upstream ([xerj-org/xerj#431](https://github.com/xerj-org/xerj/pull/431))
-and is **not merged** — independent review found that resolving `_seq_no`
+A first fix attempted upstream ([xerj-org/xerj#431](https://github.com/xerj-org/xerj/pull/431))
+was never merged — independent review found that resolving `_seq_no`
 live at continuation-page render time, while `_source` is served from the
 scroll's point-in-time snapshot, can pair an *old* body with a *new*
 sequence number if a write lands in between. Fed back as
 `if_seq_no`/`version_type: external` — exactly how this tool uses it —
 that stale body passes optimistic-concurrency checks and silently
 overwrites the newer write. Worse than the missing field it would have
-replaced. The maintainer marked it `DO NOT MERGE` and is tracking a
-proper engine-level fix; see the PR for the full trace.
+replaced. The maintainer marked it `DO NOT MERGE` and tracked the
+structural root cause separately as
+[xerj-org/xerj#440](https://github.com/xerj-org/xerj/issues/440):
+`_seq_no`/`_version` were resolved in a second pass over the live version
+map, after `_source` had already been read from the scroll's snapshot —
+the same torn-read shape as #431's failed patch, just one layer down.
+
+**#440 and #428 were both closed by [xerj-org/xerj#499](https://github.com/xerj-org/xerj/pull/499),
+merged 2026-08-19 (commit `7a89134`), shipped in v1.0.0-rc.19** (current
+as of this writing: v1.0.0-rc.20, 2026-08-20). The merged fix reads
+`seq_no`/`version` in `Index::search`, from the same pass that resolves
+`_source`, stores them on `executor::Hit`, and snapshots them into
+`ScrollContext` at scroll-open — continuation pages serve from that
+snapshot instead of re-resolving anything. That closes the torn-read
+window at its source rather than narrowing it at the API layer, which is
+exactly the fix #431 couldn't be.
 
 That finding applies equally to a naive client-side workaround, so this
 tool's own fix took it into account: `backfill_missing_seq_no` in
 `scan.rs` still makes one `_mget?seq_no_primary_term=true` call per
 affected page (carrying only that page's missing ids, not the whole
-page again), but now takes **both `_seq_no` and `_source`** from that
+page again), but takes **both `_seq_no` and `_source`** from that
 same `_mget` response, rather than keeping the scroll page's `_source`
 next to a freshly-fetched `_seq_no`. A single-document `_mget` is a
 direct read, not xerj's gather-then-resolve-later scroll path, so the
@@ -164,7 +179,11 @@ race: a document updated between its scroll page and the backfill call
 now correctly ships with the *new* content and the *new* version
 together — reconstructing the old (pre-fix) behavior side by side
 confirmed it would have shipped the old content stamped with the new
-version, the same torn pairing #431 was drafted for.
+version, the same torn pairing #431 was drafted for. That fallback is
+left in place even against a fixed xerj: it only fires when a page comes
+back without `_seq_no`, which v1.0.0-rc.19+ won't do, so it's a zero-cost
+dead branch there — and still a real safety net against any source still
+on an older release.
 
 Concretely, today:
 
